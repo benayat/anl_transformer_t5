@@ -1,0 +1,34 @@
+[project]
+name = "seqneg-standalone"
+version = "0.1.0"
+description = "Standalone seq2seq negotiator training/evaluation package"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "transformers",
+  "datasets",
+  "pandas",
+  "pyarrow",
+  "numpy",
+  "typer",
+  "filelock",
+  "accelerate>=1.13.0",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["seq2seq_negotiator"]
+
+[project.scripts]
+seqneg-build-dataset = "seq2seq_negotiator.scripts.build_dataset:app"
+seqneg-train = "seq2seq_negotiator.scripts.train:app"
+seqneg-eval = "seq2seq_negotiator.scripts.evaluate_model:app"
+seqneg-predict = "seq2seq_negotiator.scripts.predict:app"
+seqneg-analyze-eval = "seq2seq_negotiator.scripts.analyze_eval:app"
