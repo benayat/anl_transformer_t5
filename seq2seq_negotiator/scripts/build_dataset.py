@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -21,6 +22,10 @@ class BuilderConfig:
     test_frac: float = 0.05
     seed: int = 13
     include_final_metrics_in_source: bool = False
+    hindsight_accept_utility_epsilon: float = 0.0
+    hindsight_accept_use_final_utility: bool = True
+    hindsight_accept_use_next_self_offer_utility: bool = True
+    hindsight_accept_use_legacy_final_agreement_fallback: bool = True
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -80,6 +85,26 @@ def canonicalize_bid(issue_names: list[str], bid: Any) -> tuple[Any, ...] | None
     if values is None:
         return None
     return tuple(values)
+
+
+def safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def find_last_visible_opp_offer(prefix_turns: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for turn in reversed(prefix_turns):
+        if turn.get("actor") == "opp" and turn.get("action_type") == "offer":
+            return turn
+    return None
+
+
+def accept_target_text_for(target_text_fn) -> str:
+    return "A" if target_text_fn is serialize_target_v2 else "ACTION ACCEPT"
 
 
 # ----------------------------------------------------------------------
@@ -323,21 +348,49 @@ def serialize_target_v2(row: dict[str, Any], turn: dict[str, Any]) -> str:
     return f"O {to_compact_bid(row, maps, turn.get('bid'))}"
 
 
-def build_main_target(target_text_fn, row: dict[str, Any], prefix_turns: list[dict[str, Any]], next_turn: dict[str, Any]) -> tuple[str, str]:
+def build_main_target(
+    target_text_fn,
+    row: dict[str, Any],
+    prefix_turns: list[dict[str, Any]],
+    next_turn: dict[str, Any],
+    cfg: BuilderConfig,
+) -> tuple[str, str]:
     teacher = target_text_fn(row, next_turn)
-    issue_names = list(row.get("issue_names", []))
+    if next_turn.get("action_type") != "offer" or not prefix_turns:
+        return teacher, "teacher_passthrough"
 
-    if next_turn.get("action_type") == "offer" and prefix_turns:
-        last_turn = prefix_turns[-1]
+    issue_names = list(row.get("issue_names", []))
+    accept_target = accept_target_text_for(target_text_fn)
+    epsilon = max(0.0, float(cfg.hindsight_accept_utility_epsilon))
+
+    last_visible_opp_offer = find_last_visible_opp_offer(prefix_turns)
+    if last_visible_opp_offer is None:
+        return teacher, "teacher_passthrough"
+
+    current_opp_utility = safe_float(last_visible_opp_offer.get("self_utility"))
+    next_self_utility = safe_float(next_turn.get("self_utility"))
+    final_utility = safe_float(row.get("final_utility"))
+    reserved_value = safe_float(row.get("reserved_value"))
+
+    if current_opp_utility is not None:
+        if reserved_value is not None and current_opp_utility + epsilon < reserved_value:
+            return teacher, "teacher_passthrough"
+
+        if cfg.hindsight_accept_use_final_utility and final_utility is not None:
+            if current_opp_utility + epsilon >= final_utility:
+                return accept_target, "hindsight_accept_visible_opp_ge_final_utility"
+
+        if cfg.hindsight_accept_use_next_self_offer_utility and next_self_utility is not None:
+            if current_opp_utility + epsilon >= next_self_utility:
+                return accept_target, "hindsight_accept_visible_opp_ge_next_self_utility"
+
+    if cfg.hindsight_accept_use_legacy_final_agreement_fallback:
         if (
-            last_turn.get("actor") == "opp"
-            and last_turn.get("action_type") == "offer"
-            and row.get("final_agreement") is not None
-            and canonicalize_bid(issue_names, last_turn.get("bid")) == canonicalize_bid(issue_names, row.get("final_agreement"))
+            row.get("final_agreement") is not None
+            and canonicalize_bid(issue_names, last_visible_opp_offer.get("bid")) == canonicalize_bid(issue_names, row.get("final_agreement"))
         ):
-            if target_text_fn is serialize_target_v2:
-                return "A", "hindsight_accept_final_agreement_visible"
-            return "ACTION ACCEPT", "hindsight_accept_final_agreement_visible"
+            return accept_target, "hindsight_accept_final_agreement_visible"
+
     return teacher, "teacher_passthrough"
 
 
@@ -379,11 +432,12 @@ def build_examples(rows: list[dict[str, Any]], cfg: BuilderConfig, *, source_tex
 
             prefix_turns = turns[:idx]
             teacher_target_text = target_text_fn(row, turn)
-            main_target_text, target_mode = build_main_target(target_text_fn, row, prefix_turns, turn)
+            main_target_text, target_mode = build_main_target(target_text_fn, row, prefix_turns, turn, cfg)
             source_text = source_text_fn(row, prefix_turns, cfg)
 
             teacher_action_label = target_text_to_action_label(teacher_target_text)
             main_action_label = target_text_to_action_label(main_target_text)
+            last_visible_opp_offer = find_last_visible_opp_offer(prefix_turns)
 
             examples.append({
                 "source_text": source_text,
@@ -402,6 +456,8 @@ def build_examples(rows: list[dict[str, Any]], cfg: BuilderConfig, *, source_tex
                 "step": turn.get("step"),
                 "rel_time": turn.get("rel_time"),
                 "reserved_value": row.get("reserved_value"),
+                "current_visible_opp_utility": safe_float(last_visible_opp_offer.get("self_utility")) if last_visible_opp_offer else None,
+                "next_self_utility": safe_float(turn.get("self_utility")),
                 "max_utility": row.get("max_utility"),
                 "final_utility": row.get("final_utility"),
                 "final_advantage": row.get("final_advantage"),
@@ -461,6 +517,10 @@ def main(
     test_frac: float = typer.Option(0.05),
     seed: int = typer.Option(13),
     include_final_metrics_in_source: bool = typer.Option(False),
+    hindsight_accept_utility_epsilon: float = typer.Option(0.0),
+    hindsight_accept_use_final_utility: bool = typer.Option(True),
+    hindsight_accept_use_next_self_offer_utility: bool = typer.Option(True),
+    hindsight_accept_use_legacy_final_agreement_fallback: bool = typer.Option(True),
 ):
     cfg = BuilderConfig(
         max_history_turns=max_history_turns,
@@ -469,6 +529,10 @@ def main(
         test_frac=test_frac,
         seed=seed,
         include_final_metrics_in_source=include_final_metrics_in_source,
+        hindsight_accept_utility_epsilon=hindsight_accept_utility_epsilon,
+        hindsight_accept_use_final_utility=hindsight_accept_use_final_utility,
+        hindsight_accept_use_next_self_offer_utility=hindsight_accept_use_next_self_offer_utility,
+        hindsight_accept_use_legacy_final_agreement_fallback=hindsight_accept_use_legacy_final_agreement_fallback,
     )
     total = cfg.train_frac + cfg.valid_frac + cfg.test_frac
     if abs(total - 1.0) > 1e-8:
@@ -509,6 +573,10 @@ def main(
         "test_frac": cfg.test_frac,
         "seed": cfg.seed,
         "include_final_metrics_in_source": cfg.include_final_metrics_in_source,
+        "hindsight_accept_utility_epsilon": cfg.hindsight_accept_utility_epsilon,
+        "hindsight_accept_use_final_utility": cfg.hindsight_accept_use_final_utility,
+        "hindsight_accept_use_next_self_offer_utility": cfg.hindsight_accept_use_next_self_offer_utility,
+        "hindsight_accept_use_legacy_final_agreement_fallback": cfg.hindsight_accept_use_legacy_final_agreement_fallback,
         "views": [
             "rich",
             "single_target_teacher",
